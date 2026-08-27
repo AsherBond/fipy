@@ -102,7 +102,8 @@ class _AbstractConvectionTerm(FaceTerm):
         when evaluation upwind direction.
 
         >>> from fipy import Grid1D, CellVariable
-        >>> from fipy import TransientTerm, ConvectionTerm, ImplicitSourceTerm
+        >>> from fipy import (TransientTerm, ConvectionTerm,
+        ...                   ImplicitSourceTerm, DiffusionTerm)
 
         >>> m = Grid1D(nx=3, dx=0.5)
         >>> v = CellVariable(mesh=m)
@@ -122,20 +123,56 @@ class _AbstractConvectionTerm(FaceTerm):
         >>> print(numerix.allclose(v, v0))
         True
 
+        Test for issue #1223
+        Ensure that proportional scaling of diffusion and convection
+        coefficients results in the same stencil.
+
+        >>> mesh = Grid1D(nx=20, dx=1.0)
+        >>> energy = CellVariable(name="energy", mesh=mesh, value=1.0)
+        >>> energy.setValue(3.0, where=mesh.x >= 10.0)
+        >>> scale = CellVariable(name="common scale", mesh=mesh, value=1.0)
+        >>> diffusion_coefficient = scale.faceValue
+        >>> convection_coefficient = (scale * energy).faceGrad
+
+        >>> v = CellVariable(name="solution", mesh=mesh, value=0.0)
+        >>> v.constrain(0.0, where=mesh.facesLeft)
+        >>> v.constrain(1.0, where=mesh.facesRight)
+
+        >>> eq = (DiffusionTerm(coeff=diffusion_coefficient, var=v)
+        ...       - ConvectionTerm(coeff=convection_coefficient, var=v)
+        ...       == 0.0)
+
+        >>> eq.solve()
+
+        >>> solution_at_scale_1 = v.value.copy()
+
+        Scale diffusion and convection by same amount and re-solve
+
+        >>> scale.value = 2.0
+        >>> v.value = 0.0
+        >>> eq.solve()
+
+        >>> solution_at_scale_2 = v.value.copy()
+
+        >>> error = float(max(abs(solution_at_scale_1 - solution_at_scale_2)))
+        >>> print(error)
+        0.0
         """
 
         if self.stencil is None:
 
             geomCoeff = self._getGeomCoeff(var)
-            large = 1e+20
-            pecletLarge = large - (geomCoeff < 0) * (2 * large)
-            if numerix.all(self._getDiagonalSign(transientGeomCoeff, diffusionGeomCoeff) < 0):
-                pecletLarge = -pecletLarge
+
+            geometrySign = 1 - 2 * (geomCoeff < 0)
+            diagonalSign = self._getDiagonalSign(transientGeomCoeff,
+                                                  diffusionGeomCoeff)
+            diagonalSign = 1 - 2 * numerix.all(diagonalSign < 0)
+            pecletLarge = 1e+20 * geometrySign * diagonalSign
 
             if diffusionGeomCoeff is None or diffusionGeomCoeff[0] is None:
                 peclet = pecletLarge
             else:
-                diffCoeff = diffusionGeomCoeff[0].numericValue
+                diffCoeff = diffusionGeomCoeff[0]
                 diffCoeff = diffCoeff - (diffCoeff == 0) * geomCoeff / pecletLarge
                 peclet = -geomCoeff / diffCoeff
 
@@ -156,6 +193,37 @@ class _AbstractConvectionTerm(FaceTerm):
                 raise VectorCoeffError
 
     def _buildMatrix(self, var, SparseMatrix, boundaryConditions=(), dt=None, transientGeomCoeff=None, diffusionGeomCoeff=None):
+        """
+        A change in diffusion must refresh the boundary-constraint weights.
+
+        >>> import fipy as fp
+
+        >>> mesh = fp.Grid1D(nx=20, dx=1.0)
+        >>> diffusion = fp.FaceVariable(mesh=mesh, value=1.)
+        >>> convection = fp.FaceVariable(mesh=mesh, rank=1, value=(1.,))
+        >>> reused = fp.CellVariable(mesh=mesh, value=0.)
+        >>> reused.constrain(0., mesh.facesLeft)
+        >>> reused.constrain(1., mesh.facesRight)
+        >>> eq = (fp.DiffusionTerm(diffusion, var=reused)
+        ...       - fp.ConvectionTerm(convection,
+        ...                           var=reused) == 0.)
+        >>> eq.solve()
+
+        >>> diffusion.setValue(2.)
+        >>> reused.setValue(0.)
+        >>> eq.solve()
+
+        >>> rebuilt = fp.CellVariable(mesh=mesh, value=0.)
+        >>> rebuilt.constrain(0., mesh.facesLeft)
+        >>> rebuilt.constrain(1., mesh.facesRight)
+        >>> rebuilt_eq = (fp.DiffusionTerm(diffusion, var=rebuilt)
+        ...               - fp.ConvectionTerm(convection,
+        ...                                   var=rebuilt) == 0.)
+        >>> rebuilt_eq.solve()
+
+        >>> print(numerix.allclose(reused, rebuilt))
+        True
+        """
 
         var, L, b = FaceTerm._buildMatrix(self, var, SparseMatrix, boundaryConditions=boundaryConditions, dt=dt, transientGeomCoeff=transientGeomCoeff, diffusionGeomCoeff=diffusionGeomCoeff)
 
@@ -172,7 +240,8 @@ class _AbstractConvectionTerm(FaceTerm):
             else:
                 alpha = 0.0
 
-            alpha_constraint = numerix.where(var.faceGrad.constraintMask, 1.0, alpha)
+            alpha_constraint = (var.faceGrad.constraintMask * 1.0
+                                + ~var.faceGrad.constraintMask * alpha)
 
             def divergence(face_value):
                 return (
@@ -264,7 +333,6 @@ class _AbstractConvectionTerm(FaceTerm):
         >>> error1 = float(np.sqrt(((var.value - expected)**2 * mesh.dx).sum()))
 
         >>> assert np.allclose(np.log(error1 / error0 ) / np.log(nx0 / nx1), 1.0, atol=0.002)
-
         """
 
 class __ConvectionTerm(_AbstractConvectionTerm):
